@@ -312,9 +312,7 @@ blas_queue_t *tscq;
 
       last_tick = (unsigned int)rpcc();
 
-	pthread_mutex_lock  (&thread_status[cpu].lock);
-        tscq=thread_status[cpu].queue;
-	pthread_mutex_unlock  (&thread_status[cpu].lock);
+      tscq = __atomic_load_n(&thread_status[cpu].queue, __ATOMIC_RELAXED);
 
 	while(!tscq) {
 	YIELDING;
@@ -339,13 +337,12 @@ blas_queue_t *tscq;
 
 	  last_tick = (unsigned int)rpcc();
 	}
-	pthread_mutex_lock  (&thread_status[cpu].lock);
-        tscq=thread_status[cpu].queue;
-	pthread_mutex_unlock  (&thread_status[cpu].lock);
+
+	tscq = __atomic_load_n(&thread_status[cpu].queue, __ATOMIC_RELAXED);
 
       }
 
-    queue = thread_status[cpu].queue;
+      queue = __atomic_load_n(&thread_status[cpu].queue, __ATOMIC_ACQUIRE);
 
     if ((long)queue == -1) break;
 
@@ -360,9 +357,7 @@ blas_queue_t *tscq;
     if (queue) {
       int (*routine)(blas_arg_t *, void *, void *, void *, void *, BLASLONG) = queue -> routine;
 
-      pthread_mutex_lock  (&thread_status[cpu].lock);
-      thread_status[cpu].queue = (blas_queue_t *)1;
-      pthread_mutex_unlock  (&thread_status[cpu].lock);
+      __atomic_store_n(&thread_status[cpu].queue, (blas_queue_t *)1, __ATOMIC_RELAXED);
 
       sa = queue -> sa;
       sb = queue -> sb;
@@ -442,13 +437,8 @@ blas_queue_t *tscq;
 
       // arm: make sure all results are written out _before_
       // thread is marked as done and other threads use them
-      WMB;
+      __atomic_store_n(&thread_status[cpu].queue, NULL, __ATOMIC_RELEASE);
 
-      pthread_mutex_lock  (&thread_status[cpu].lock);
-      thread_status[cpu].queue = (blas_queue_t * volatile) ((long)thread_status[cpu].queue & 0);  /* Need a trick */
-      pthread_mutex_unlock  (&thread_status[cpu].lock);
-      
-      WMB;
 
     }
 
@@ -569,9 +559,6 @@ int blas_thread_init(void){
       thread_status[i].queue  = (blas_queue_t *)NULL;
       thread_status[i].status = THREAD_STATUS_WAKEUP;
 
-      pthread_mutex_init(&thread_status[i].lock, NULL);
-      pthread_cond_init (&thread_status[i].wakeup, NULL);
-
 #ifdef NEED_STACKATTR
       ret=pthread_create(&blas_threads[i], &attr,
 		     &blas_thread_server, (void *)i);
@@ -669,36 +656,24 @@ int exec_blas_async(BLASLONG pos, blas_queue_t *queue){
 	} while (1);
 
       } else {
-	pthread_mutex_lock (&thread_status[i].lock);
-	tsiq = thread_status[i].queue;
-	pthread_mutex_unlock (&thread_status[i].lock);      
+	tsiq = __atomic_load_n(&thread_status[i].queue, __ATOMIC_RELAXED);
 	while(tsiq) {
 	  i ++;
 	  if (i >= blas_num_threads - 1) i = 0;
-	  pthread_mutex_lock (&thread_status[i].lock);
-	  tsiq = thread_status[i].queue;
-	  pthread_mutex_unlock (&thread_status[i].lock);
+	  tsiq = __atomic_load_n(&thread_status[i].queue, __ATOMIC_RELAXED);
 	}
       }
 #else
-      pthread_mutex_lock  (&thread_status[i].lock);
-      tsiq=thread_status[i].queue ;
-      pthread_mutex_unlock  (&thread_status[i].lock);
+      tsiq = __atomic_load_n(&thread_status[i].queue, __ATOMIC_RELAXED);
       while(tsiq) {
 	i ++;
 	if (i >= blas_num_threads - 1) i = 0;
-        pthread_mutex_lock  (&thread_status[i].lock);
-        tsiq=thread_status[i].queue ;
-        pthread_mutex_unlock  (&thread_status[i].lock);
+        tsiq = __atomic_load_n(&thread_status[i].queue, __ATOMIC_RELAXED);
       }
 #endif
 
       queue -> assigned = i;
-      WMB;
-      pthread_mutex_lock  (&thread_status[i].lock);
-      thread_status[i].queue = queue;
-      pthread_mutex_unlock  (&thread_status[i].lock);
-      WMB;
+      __atomic_store_n(&thread_status[i].queue, queue, __ATOMIC_RELEASE);
 
       queue = queue -> next;
       pos ++;
@@ -718,9 +693,7 @@ int exec_blas_async(BLASLONG pos, blas_queue_t *queue){
 
       pos = current -> assigned;
 
-      pthread_mutex_lock  (&thread_status[pos].lock);
-      tspq=thread_status[pos].queue;
-      pthread_mutex_unlock  (&thread_status[pos].lock);
+      tspq = __atomic_load_n(&thread_status[pos].queue, __ATOMIC_RELAXED);
 
       if ((BLASULONG)tspq > 1) {
 	pthread_mutex_lock  (&thread_status[pos].lock);
@@ -752,23 +725,19 @@ int exec_blas_async_wait(BLASLONG num, blas_queue_t *queue){
 
     while ((num > 0) && queue) {
 
-      pthread_mutex_lock(&thread_status[queue->assigned].lock);
-      tsqq=thread_status[queue -> assigned].queue;
-      pthread_mutex_unlock(&thread_status[queue->assigned].lock);
+      tsqq = __atomic_load_n(&thread_status[queue->assigned].queue, __ATOMIC_RELAXED);
 
 
       while(tsqq) {
 	YIELDING;
-        pthread_mutex_lock(&thread_status[queue->assigned].lock);
-        tsqq=thread_status[queue -> assigned].queue;
-        pthread_mutex_unlock(&thread_status[queue->assigned].lock);
-
-
+        tsqq = __atomic_load_n(&thread_status[queue->assigned].queue, __ATOMIC_RELAXED);
       };
 
       queue = queue -> next;
       num --;
     }
+
+    MB;
 
 #ifdef SMP_DEBUG
   fprintf(STDERR, "Done.\n\n");
@@ -971,9 +940,9 @@ int BLASFUNC(blas_thread_shutdown)(void){
 
   for (i = 0; i < blas_num_threads - 1; i++) {
 
-    pthread_mutex_lock (&thread_status[i].lock);
+    __atomic_store_n(&thread_status[i].queue, (blas_queue_t *)-1, __ATOMIC_RELAXED);
 
-    thread_status[i].queue = (blas_queue_t *)-1;
+    pthread_mutex_lock (&thread_status[i].lock);
 
     thread_status[i].status = THREAD_STATUS_WAKEUP;
 

@@ -68,21 +68,6 @@ double sqrt(double);
 #define GETRF_FACTOR 1.00
 
 
-#if   defined(USE_PTHREAD_LOCK)
-static pthread_mutex_t    getrf_lock = PTHREAD_MUTEX_INITIALIZER;
-#elif defined(USE_PTHREAD_SPINLOCK)
-static pthread_spinlock_t getrf_lock = 0;
-#else
-static BLASULONG  getrf_lock = 0UL;
-#endif
-
-#if   defined(USE_PTHREAD_LOCK)
-static pthread_mutex_t    getrf_flag_lock = PTHREAD_MUTEX_INITIALIZER;
-#elif defined(USE_PTHREAD_SPINLOCK)
-static pthread_spinlock_t getrf_flag_lock = 0;
-#else
-static BLASULONG  getrf_flag_lock = 0UL;
-#endif
 
 
 
@@ -280,9 +265,7 @@ static int inner_advanced_thread(blas_arg_t *args, BLASLONG *range_m, BLASLONG *
 #if 1
     {
 	do {
-	    LOCK_COMMAND(&getrf_lock);
-	    jw = job[mypos].working[i][CACHE_LINE_SIZE * bufferside];
-	    UNLOCK_COMMAND(&getrf_lock);
+	   jw =  __atomic_load_n(&job[mypos].working[i][CACHE_LINE_SIZE * bufferside], __ATOMIC_ACQUIRE);
 	} while (jw);
     }
 #else
@@ -324,23 +307,17 @@ static int inner_advanced_thread(blas_arg_t *args, BLASLONG *range_m, BLASLONG *
 		       b   + (is + jjs * lda) * COMPSIZE, lda, is);
       }
     }
-    MB;
     for (i = 0; i < args -> nthreads; i++) {
-      LOCK_COMMAND(&getrf_lock);
-      job[mypos].working[i][CACHE_LINE_SIZE * bufferside] = (BLASLONG)buffer[bufferside];
-      UNLOCK_COMMAND(&getrf_lock);
+      __atomic_store_n(&job[mypos].working[i][CACHE_LINE_SIZE * bufferside], (BLASLONG)buffer[bufferside],
+		      __ATOMIC_RELEASE);
     }
   }
 
-  LOCK_COMMAND(&getrf_flag_lock);
-  flag[mypos * CACHE_LINE_SIZE] = 0;
-  UNLOCK_COMMAND(&getrf_flag_lock);
+  __atomic_store_n(&flag[mypos * CACHE_LINE_SIZE], 0, __ATOMIC_RELEASE);
 
   if (m == 0) {
     for (xxx = 0; xxx < DIVIDE_RATE; xxx++) {
-      LOCK_COMMAND(&getrf_lock);
-      job[mypos].working[mypos][CACHE_LINE_SIZE * xxx] = 0;
-      UNLOCK_COMMAND(&getrf_lock);
+      __atomic_store_n(&job[mypos].working[mypos][CACHE_LINE_SIZE * xxx], 0, __ATOMIC_RELEASE);
     }
   }
 
@@ -366,10 +343,9 @@ static int inner_advanced_thread(blas_arg_t *args, BLASLONG *range_m, BLASLONG *
 	  if ((current != mypos) && (!is)) {
 #if 1
 		do {
-		    LOCK_COMMAND(&getrf_lock);
-		    jw = job[current].working[mypos][CACHE_LINE_SIZE * bufferside];
-		    UNLOCK_COMMAND(&getrf_lock);
-		} while (jw == 0);
+		   jw =  __atomic_load_n(&job[current].working[mypos][CACHE_LINE_SIZE * bufferside],
+				   __ATOMIC_ACQUIRE);
+	        } while (jw == 0);
 #else
 	    	    while(job[current].working[mypos][CACHE_LINE_SIZE * bufferside] == 0) {};
 #endif
@@ -381,9 +357,7 @@ static int inner_advanced_thread(blas_arg_t *args, BLASLONG *range_m, BLASLONG *
 
 	  MB;
 	  if (is + min_i >= m) {
-            LOCK_COMMAND(&getrf_lock);
-	    job[current].working[mypos][CACHE_LINE_SIZE * bufferside] = 0;
-            UNLOCK_COMMAND(&getrf_lock);
+	    __atomic_store_n(&job[current].working[mypos][CACHE_LINE_SIZE * bufferside], 0, __ATOMIC_ACQUIRE);
 	  }
 	}
 
@@ -397,9 +371,7 @@ static int inner_advanced_thread(blas_arg_t *args, BLASLONG *range_m, BLASLONG *
     for (xxx = 0; xxx < DIVIDE_RATE; xxx++) {
 #if 1
 	do {
-	    LOCK_COMMAND(&getrf_lock);
-	    jw = job[mypos].working[i][CACHE_LINE_SIZE *xxx];
-	    UNLOCK_COMMAND(&getrf_lock);
+	    jw = __atomic_load_n(&job[mypos].working[i][CACHE_LINE_SIZE *xxx], __ATOMIC_RELAXED);
 	} while(jw != 0);
 #else
       while (job[mypos].working[i][CACHE_LINE_SIZE * xxx] ) {};
@@ -608,7 +580,7 @@ blasint CNAME(blas_arg_t *args, BLASLONG *range_m, BLASLONG *range_n, FLOAT *sa,
       queue[num_cpu].sa      = NULL;
       queue[num_cpu].sb      = NULL;
       queue[num_cpu].next    = &queue[num_cpu + 1];
-      flag[num_cpu * CACHE_LINE_SIZE] = 1;
+      __atomic_store_n(&flag[num_cpu * CACHE_LINE_SIZE], 1, __ATOMIC_RELEASE);
 
       num_cpu ++;
 
@@ -647,14 +619,9 @@ blasint CNAME(blas_arg_t *args, BLASLONG *range_m, BLASLONG *range_n, FLOAT *sa,
 
       for (i = 0; i < num_cpu; i ++) {
 #if 1
-	      LOCK_COMMAND(&getrf_flag_lock);
-	      f=flag[i*CACHE_LINE_SIZE];
-	      UNLOCK_COMMAND(&getrf_flag_lock);
-	      while (f!=0) {
-	      LOCK_COMMAND(&getrf_flag_lock);
-	      f=flag[i*CACHE_LINE_SIZE];
-	      UNLOCK_COMMAND(&getrf_flag_lock);
-	      };
+	      do {
+		   f =  __atomic_load_n(&flag[i*CACHE_LINE_SIZE], __ATOMIC_ACQUIRE);
+	      } while (f != 0);
 #else
               while (flag[i*CACHE_LINE_SIZE]) {};
 #endif
